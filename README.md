@@ -9,7 +9,7 @@ data. *--GitHub Copilot*
 Comments are almost non-existant, but the code is short and fairly 
 straigtforward. Some questionable tricks have been employed for
 entertainment purposes. I don't expect anyone will ever use this 
-in production. I had fun writing it.
+in production. I had fun writing it. 
 
 ## Installation
 `supr` is available on PyPI and can be installed with `pip`:
@@ -47,7 +47,7 @@ should be added in the future along with the boilerplate necessary
 to support a distributed LLM.
 
 ## Configuration
-`supr` is configured with a YAML file `~/supr.yaml`.
+`supr` is configured with a YAML file `./supr.yaml`.
 
 ### Example
 ```yaml
