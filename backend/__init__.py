@@ -1,20 +1,23 @@
-import os, sys, time
+import time
 import threading
-from datetime import timedelta
-from abc import ABCMeta, abstractmethod
+import abc
 from pathlib import PurePath as path
 import fabric, paramiko
 from patchwork.transfers import rsync
 from patchwork.files import exists
-from paramiko import ssh_exception
-from supr import CONF, ANSI, LOCAL_EXCLUDE, state
-from supr import log
+from supr import CONF, ANSI, LOCAL_EXCLUDE, state, log
 
 class F:
+    """
+    Instance list filter generator.
+    """
     def __init__(self, name): self.name = name
     def __getitem__(self, values):
         # TODO abstract this; anything aws should be in aws.py
-        return {'Name': self.name, 'Values': [values, ] if isinstance(values, str) else list(values) }
+        return {
+            'Name': self.name, 
+            'Values': [values, ] if isinstance(values, str) else list(values), 
+        }
 
 F_ID = F('instance-id')
 F_STATE = F('instance-state-name')
@@ -24,23 +27,34 @@ F_NAME = F('tag:Name')
 _CARRIAGE_RETURN = b'^\x00\x00\x00\x00\x00\x00\x00\x01\n'
 class sshtransport(paramiko.transport.Transport):
     def _send_user_message(self, data):
+        # This is where we actually ping the state.
         if hasattr(self, '_activity_callback') and bytes(data) == _CARRIAGE_RETURN:
+            # By using a thread here, we avoid blocking the transport.
             threading.Thread(target=self._activity_callback).start()
         return super()._send_user_message(data)
 class sshclient(paramiko.SSHClient):
+    """
+    Hacks paramiko to provide a callback for activity.
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.activity_callback = lambda: None
+        self.activity_callback = lambda: None # override this
     def connect(self, *args, **kwargs):
         kwargs['transport_factory'] = self.get_transport_factory()
         super().connect(*args, **kwargs)
     def get_transport_factory(self):
+        # Override the transport factory to use our custom transport and 
+        # # reference our callback.
         def f(*args, **kwargs):
             t = sshtransport(*args, **kwargs)
             t._activity_callback = self.activity_callback
             return t
         return f
 class connection(fabric.Connection):
+    """
+    Extends fabric.Connection to provide a callback for activity.
+    Pass your callback as `activity_callback` to the constructor.
+    """
     def __init__(self, *args, **kwargs):
         activity_callback = kwargs.pop('activity_callback', lambda: None)
         super().__init__(*args, **kwargs)
@@ -48,13 +62,33 @@ class connection(fabric.Connection):
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.client.activity_callback = activity_callback
 
+class _abstractinstance(metaclass=abc.ABCMeta):
+    """
+    Methods that must be provided on instance implementatons.
+    """
+    id = property()
+    name = property()
+    state = property()
+    tags = property()
+    public_ip_address = property()
+    private_ip_address = property()
+    instance_type = property()
+    def _start(self) -> None: pass
+    def _stop(self) -> None: pass
+    def _terminate(self) -> None: pass
+    def wait_until_running(self) -> None: pass
+    def wait_until_stopped(self) -> None: pass
+    def wait_until_terminated(self) -> None: pass
+    def _attach_volume(self, name) -> None: pass
+
 class _instance:
+    """
+    Shared logic for instance implementations.
+    """
     conf = property(lambda self: self.__class__.get_conf(self.name))
     is_super = property(lambda self: self.conf.get('super', False))
     user = property(lambda self: self.conf['user'])
     group = property(lambda self: self.conf.get('group', self.user))
-    #uid = property(lambda self: self.cmd(f"id -u {self.user}", hide=True).stdout.strip())
-    #gid = property(lambda self: self.cmd(f"id -g {self.group}", hide=True).stdout.strip())
     home = property(lambda self: path("/home")/self.conf['user'])
     env = property(lambda self: path(self.conf['env']))
     py_bin = property(lambda self: self.env/'bin/python')
@@ -73,7 +107,7 @@ class _instance:
         i.wait_until_running()
         while True:
             try: i.connection.open(); break
-            except ssh_exception.NoValidConnectionsError: time.sleep(2)
+            except paramiko.ssh_exception.NoValidConnectionsError: time.sleep(2)
         i.cmd('sudo hostname %s' % i.name)
         i.connection.local(f"ssh-keyscan {i.private_ip_address} >> ~/.ssh/known_hosts")
         i.install_essential()
@@ -220,10 +254,10 @@ class _instance:
         self._add_apt_sources()
         self.cmd("sudo apt-get update && sudo apt-get upgrade -y")
         self.cmd("sudo apt-get install -y linux-headers-$(uname -r)")
-        self._install_apt('rsync s3fs git-core python3 python3-pip python3-venv')
+        self._install_apt("rsync s3fs git-core python3 python3-pip python3-venv")
         if not self.exists(self.env):
             self.cmd(f"python3 -m venv {self.env}")
-        self._install_pip('setuptools wheel')
+        self._install_pip("setuptools wheel")
     def install_base(self):
         state.activity(self.id)
         for s_n in self.conf.get('packages', {}).get('base', ()):
@@ -236,34 +270,24 @@ class _instance:
         if 'entrypoint' in self.conf:
             self.ssh(self.conf['entrypoint'])
 
+class baseinstance(_instance, _abstractinstance): pass
+
+class _abstractbackend(metaclass=abc.ABCMeta):
+    """
+    Methods that must be provided on backend implementatons.
+    """
+    def create_instance(self, name): pass
+    def get_instance_by_id(self, _id): pass
+    def get_instances(self, *filters): pass
+
 class _backend:
+    """
+    Shared logic for backend implementations.
+    """
     def get_instance(self, name, *filters) -> _instance:
         i = self.get_instances(*list(filters) + [F_NAME[name]])
         if len(i) < 1: print("no instances with name %s" % name); return None
         if len(i) > 1: print("warning: multiple instances with name %s" % name)
         return i[0]
 
-class _abstractinstance(metaclass=ABCMeta):
-    id = property()
-    name = property()
-    state = property()
-    tags = property()
-    public_ip_address = property()
-    private_ip_address = property()
-    instance_type = property()
-    def _start(self) -> None: pass
-    def _stop(self) -> None: pass
-    def _terminate(self) -> None: pass
-    def wait_until_running(self) -> None: pass
-    def wait_until_stopped(self) -> None: pass
-    def wait_until_terminated(self) -> None: pass
-    def _attach_volume(self, name) -> None: pass
-
-class _abstractbackend(metaclass=ABCMeta):
-    def create_instance(self, name): pass
-    def get_instance_by_id(self, _id): pass
-    def get_instances(self, *filters): pass
-
-class baseinstance(_instance, _abstractinstance): pass
 class basebackend(_backend, _abstractbackend): pass
-

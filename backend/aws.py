@@ -1,5 +1,4 @@
 import boto3
-from botocore.exceptions import ClientError
 from supr import DEBUG, CONF
 from supr.backend import baseinstance, basebackend
 

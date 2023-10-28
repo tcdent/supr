@@ -13,8 +13,11 @@ def costs():
             cost=hours * i.conf['hour_cost']))
 
 def main():
-    def i(n, f=F_ACTIVE): x = backend.get_instance(n, f); return x.print() if x else None
-    def p(*f): [print(x) for x in backend.get_instances(*f)]
+    def i(n, f=F_ACTIVE):
+        x = backend.get_instance(n, f)
+        return x.print() if x else None
+    def p(*f):
+        [print(x) for x in backend.get_instances(*f)]
     def c(n):
         if i(n): print(f"instance {n} already exists"); return
         instance.new(n); i(n)

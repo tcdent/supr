@@ -1,9 +1,11 @@
-from datetime import timedelta
 import sqlite3
 from supr import log, IDLE_TIMEOUT
 
 
 class localstate:
+    """
+    State tracks instance activity and runtime.
+    """
     _schema = """
     CREATE TABLE IF NOT EXISTS instance_runtime (
         native_id text, 
