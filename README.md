@@ -27,30 +27,33 @@ Some expected ones are:
 `supr [instance] stop`
 
 `supr [instance] ssh`
-`supr [instance] cmd [command]`
+`supr [instance] run [command]`
 
 `supr [instance] deploy`
+`supr [instance] [hook]`
 
 ## Motivations
 This was conceived as a way to economically implement LLM's on AWS.
 Some of the design decisions made reflect this and deviate from sane
-defaults.
+defaults. 
 
 ### Timeouts
-`supr` uses timeouts to prevent instances from idling if forgotten. This
-is not always desirable and can be disabled with `super:true` or `auto_stop:false`.
+When `IDLE_TIMEOUT` is set, `supr` will stop an instance if it has been
+idle for more than `IDLE_TIMEOUT` minutes. This is not always desirable 
+on every instance and can be disabled with `super:true` or `auto_stop:false`
+in the instance config.
 
 ### Scaling Instances
 `supr` will not start an instance if there is already an instance with
-the same name. Support for multiple instances with the same config
-should be added in the future along with the boilerplate necessary
-to support a distributed LLM.
+the same name. TODO: a naming strategy & interface for clusters.
 
 ## Configuration
 `supr` is configured with a YAML file `./supr.yaml`.
 
 ### Example
 ```yaml
+IDLE_TIMEOUT: 15
+
 aws: &aws
   aws:
     key: # AWS key
@@ -69,7 +72,7 @@ packages:
   - pip:numpy
   - pip:pyopencl
   compute-app: &packages_compute-app
-  - local:deploy # Path to a local package
+  - local:app # local project at ./app
 
 systems:
   debian-12: &systems_debian-12
@@ -95,6 +98,10 @@ volumes: &volumes_shared
     provider: aws:s3
     id: files # AWS S3 bucket name
     mount: /mnt/files
+  swap:
+    provider: swap
+    path: /var/swap.1
+    size: 10G
 
 base: &base
   <<: *aws
@@ -111,13 +118,12 @@ supr:
   <<: *base
   <<: *sizes_micro
   <<: *systems_debian-12
-  env: /home/admin/.env
   volumes: 
     <<: *volumes_shared
     root:
       provider: aws:ebs
       dev: /dev/xvda
-      size: 16
+      size: 120
   crontab:
   - "*/5 * * * * /home/admin/.env/bin/python -m supr.cron"
   packages:
@@ -131,13 +137,13 @@ www:
     <<: *base
     <<: *sizes_micro
     <<: *systems_debian-12
-    env: /home/admin/.env
     packages:
-        base: 
-        - apt:apache2
-        app:
-        - local:deploy
-    entrypoint: bash deploy/entrypoint.sh
+      base: 
+      - apt:apache2
+      app:
+      - local:deploy
+    hooks:
+      reload: service apache2 reload
 
 compute-base: &compute-base
   <<: *base
@@ -157,7 +163,8 @@ compute-small:
   packages:
     base: *packages_compute-base
     app: *packages_compute-app
-  entrypoint: bash deploy/entrypoint.sh
+  hooks:
+    build: bash build.sh
 ```
 
 
