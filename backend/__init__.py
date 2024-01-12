@@ -2,10 +2,11 @@ import time
 import threading
 import abc
 from pathlib import PurePath as path
+import uuid
 import fabric, paramiko
 from patchwork.transfers import rsync
 from patchwork.files import exists
-from supr import CONF, ANSI, LOCAL_EXCLUDE, state, log
+from supr import CONF, ANSI, state, log
 
 class F:
     """
@@ -24,14 +25,6 @@ F_STATE = F('instance-state-name')
 F_ACTIVE = F_STATE['pending', 'running', 'stopping', 'stopped']
 F_NAME = F('tag:Name')
 
-_CARRIAGE_RETURN = b'^\x00\x00\x00\x00\x00\x00\x00\x01\n'
-class sshtransport(paramiko.transport.Transport):
-    def _send_user_message(self, data):
-        # This is where we actually ping the state.
-        if hasattr(self, '_activity_callback') and bytes(data) == _CARRIAGE_RETURN:
-            # By using a thread here, we avoid blocking the transport.
-            threading.Thread(target=self._activity_callback).start()
-        return super()._send_user_message(data)
 class sshclient(paramiko.SSHClient):
     """
     Hacks paramiko to provide a callback for activity.
@@ -40,16 +33,25 @@ class sshclient(paramiko.SSHClient):
         super().__init__(*args, **kwargs)
         self.activity_callback = lambda: None # override this
     def connect(self, *args, **kwargs):
-        kwargs['transport_factory'] = self.get_transport_factory()
+        kwargs['transport_factory'] = self._get_transport_factory()
         super().connect(*args, **kwargs)
-    def get_transport_factory(self):
-        # Override the transport factory to use our custom transport and 
-        # # reference our callback.
-        def f(*args, **kwargs):
-            t = sshtransport(*args, **kwargs)
-            t._activity_callback = self.activity_callback
-            return t
-        return f
+    def _get_transport_factory(self):
+        def wrap(original, callback):
+            last_call = time.time()
+            def _wrap(*args, **kwargs):
+                nonlocal last_call
+                if time.time() - last_call > 1:
+                    threading.Thread(target=callback).start()
+                    last_call = time.time()
+                return original(*args, **kwargs)
+            return _wrap
+        def factory(*args, **kwargs):
+            from paramiko.common import MSG_CHANNEL_DATA
+            transport = paramiko.transport.Transport(*args, **kwargs)
+            _feed = transport._channel_handler_table[MSG_CHANNEL_DATA]
+            transport._channel_handler_table[MSG_CHANNEL_DATA] = wrap(_feed, self.activity_callback)
+            return transport
+        return factory
 class connection(fabric.Connection):
     """
     Extends fabric.Connection to provide a callback for activity.
@@ -97,23 +99,19 @@ class _instance:
     apt_cache = property(lambda self: path(self.conf['apt_cache']) if 'apt_cache' in self.conf else None)
     wheel_cache = property(lambda self: path(self.conf['wheel_cache']) if 'wheel_cache' in self.conf else None)
     _storage_handlers = [
-        ('native', lambda self, name: self.mount(name)),
+        ('native', lambda self, name: self.mount(name)), 
+        ('swap', lambda self, name: self.swap(name))
     ]
     @classmethod
     def new(cls, name):
         from supr import backend
         i = backend.create_instance(name)
         state.change(i.id, 'start')
+        print(f"creating {i.name}...")
         i.wait_until_running()
         while True:
             try: i.connection.open(); break
             except paramiko.ssh_exception.NoValidConnectionsError: time.sleep(2)
-        i.cmd('sudo hostname %s' % i.name)
-        i.connection.local(f"ssh-keyscan {i.private_ip_address} >> ~/.ssh/known_hosts")
-        i.install_essential()
-        i.attach_volumes()
-        i.install_base()
-        i.install_crontab()
         return i
     def __repr__(self) -> str:
         return "".join([
@@ -149,9 +147,6 @@ class _instance:
     @property
     def vars(self):
         return self.conf.get('vars', {})
-    def print(self):
-        print(self)
-        return self
     def start(self):
         state.change(self.id, 'start')
         self._start()
@@ -160,6 +155,16 @@ class _instance:
         self._stop()
         self.wait_until_stopped()
         state.change(self.id, 'stop')
+    def init(self):
+        self.cmd('sudo hostname %s' % self.name)
+        self.connection.local(f"ssh-keyscan {self.private_ip_address} >> ~/.ssh/known_hosts")
+        self.install_essential()
+        self.attach_volumes()
+        self.install_base()
+        self.install_crontab()
+    def snapshot(self):
+        id_ = self._snapshot(f"{self.name}-snapshot-{uuid.uuid4().hex}")
+        print(f"{self.name}: {id_}")
     def terminate(self):
         if self.is_super: print("you probably don't want to do that"); return
         self._terminate()
@@ -168,12 +173,8 @@ class _instance:
     def run(self, cmd, *args, **kwargs):
         state.activity(self.id)
         return self.connection.run(cmd, env=self.vars, *args, **kwargs)
-    def ssh(self, cmd='bash'):
-        # source {self.env}/bin/activate
-        #return self.run("TERM='xterm-256color'; {cmd}", pty=True)
-        return self.run(f"source {self.env}/bin/activate; {cmd}", pty=True)
-    def cmd(self, *args, **kwargs):
-        return self.run(' '.join(args), **kwargs)
+    def ssh(self, shell='bash'):
+        return self.run(f"source {self.env}/bin/activate; {shell}", pty=True)
     def put(self, local, remote):
         state.activity(self.id)
         return self.connection.put(local, remote)
@@ -192,16 +193,29 @@ class _instance:
     def attach_volumes(self):
         state.activity(self.id)
         [self._attach_volume(v) for v in self.conf.get('volumes', {}).keys()]
-    def mount(self, name):
+    def mount(self, name, force=False):
         assert name in self.conf.get('volumes', ())
         conf = self.conf['volumes'][name]
         assert {'dev', 'mount'}.issubset(conf)
-        self.cmd(f"sudo mkdir -p {conf['mount']}")
-        self.cmd(f"sudo chown {self.user}:{self.group} {conf['mount']}")
-        if self.cmd("mount | grep %s" % conf['mount'], warn=True).failed:
-            self.cmd("mount%s %s %s" % (
-                " -o %s" % ','.join(conf['options']) if 'options' in conf else '', 
-                conf['dev'], conf['mount']))
+        dev, mount = conf['dev'], conf['mount']
+        if not force and self.cmd(f"mount | grep {mount}", warn=True).ok:
+            return
+        self.cmd(f"sudo umount {mount}", warn=True)
+        self.cmd(f"sudo mkdir -p {mount}")
+        self.cmd(f"sudo chown {self.user}:{self.group} {mount}")
+        if 'options' in conf:
+            opts = " -o %s" % ','.join(conf['options'])
+        self.cmd(f"mount{opts} {dev} {mount}")
+    def swap(self, name):
+        assert name in self.conf.get('volumes', ())
+        conf = self.conf['volumes'][name]
+        assert {'path', 'size'}.issubset(conf)
+        path, size = conf['path'], conf['size']
+        if not self.exists(path):
+            self.cmd(f"sudo dd if=/dev/zero of={path} bs=1M count={size}")
+            self.cmd(f"sudo chmod 600 {path}")
+            self.cmd(f"sudo /sbin/mkswap {path}")
+        self.cmd(f"sudo /sbin/swapon {path}", warn=True)
     def install_crontab(self):
         state.activity(self.meta.id)
         for cmd in self.conf.get('crontab', ()):
@@ -219,14 +233,22 @@ class _instance:
             f"Suites: {self.dist_release}\n"
             f"Components: ")
         conf += ' '.join(self.conf['apt_sources'])
-        self.cmd(f"echo '{conf}' | sudo tee /etc/apt/sources.list.d/user.sources")        
-    def _install_apt(self, name):
+        self.cmd(f"echo '{conf}' | sudo tee /etc/apt/sources.list.d/user.sources") 
+    def _apt_get(self, command, name=''):
+        # Throwing the kitchen sink at this to get openssh-server to go non-interactive
+        opts = (
+            "Dpkg::Options::=\"--force-confdef\"", 
+            "Dpkg::Options::=\"--force-confold\"", )
         if self.apt_cache and self.exists(self.apt_cache):
-            self.cmd(f"sudo apt-get install -y -o Dir::Cache::Archives={self.apt_cache} {name}")
-        else:
-            self.cmd(f"sudo apt-get install -y {name}")
+            opts += (f"Dir::Cache::Archives={self.apt_cache}", )
+        args = ' '.join(f"-o {o}" for o in opts)
+        self.cmd(f"sudo -E apt-get {command} -yq {args} {name}")
+        #self.cmd(f"bin/apt-get-install {name}")
+    def _install_apt(self, name):
+        self._apt_get('install', name)
     def _install_pip(self, name):
         # TODO pyopencl builds itself every time
+        # TODO --upgrade everything?
         if self.wheel_cache and self.exists(self.wheel_cache):
             self.cmd(f"{self.pip_bin} wheel --wheel-dir={self.wheel_cache} {name}")
             self.cmd(f"{self.pip_bin} install --no-index --find-links={self.wheel_cache} {name}")
@@ -237,38 +259,37 @@ class _instance:
         self.cmd(f"git -C {repo} pull || git clone --depth=1 https://github.com/{user}/{repo}.git {repo}")
         self.cmd(f"{self.pip_bin} install {repo}")
     def _install_local(self, name):
-        self.rsync(name, '', delete=False, exclude=LOCAL_EXCLUDE)
+        self.rsync(name, '', delete=False, exclude=CONF['LOCAL_EXCLUDE'])
         # TODO: this could support more options
         self.cmd(f"{self.pip_bin} install -e {name}")
-    def _install(self, source, name):
+    def install(self, source, name):
         match source, name:
             case ['apt', name]: self._install_apt(name)
             case ['pip', name]: self._install_pip(name)
             case ['github', name]: self._install_github(name)
             case ['local', name]: self._install_local(name)
-            case ['sh', cmd]: self._install_sh(cmd)
             case _: assert False, f"invalid package source {source}"
     def install_essential(self):
-        # TODO: strip this down even more so we can get s3 mounted and have a cache available
-        # `upgrade` might be excessive
         self._add_apt_sources()
-        self.cmd("sudo apt-get update && sudo apt-get upgrade -y")
-        self.cmd("sudo apt-get install -y linux-headers-$(uname -r)")
-        self._install_apt("rsync s3fs git-core python3 python3-pip python3-venv")
+        self.cmd("sudo apt-get update")
+        self._install_apt(' '.join(CONF['APT_ESSENTIAL']))
         if not self.exists(self.env):
             self.cmd(f"python3 -m venv {self.env}")
-        self._install_pip("setuptools wheel")
+        self._install_pip(' '.join(CONF['PIP_ESSENTIAL']))
     def install_base(self):
         state.activity(self.id)
         for s_n in self.conf.get('packages', {}).get('base', ()):
-            self._install(*s_n.split(':'))
-    def deploy(self, no_deps=False):
+            self.install(*s_n.split(':'))
+    def deploy(self):
         state.activity(self.id)
         for s_n in self.conf.get('packages', {}).get('app', ()):
-            if no_deps and not s_n.startswith('local:'): continue
-            self._install(*s_n.split(':'))
-        if 'entrypoint' in self.conf:
-            self.ssh(self.conf['entrypoint'])
+            self.install(*s_n.split(':'))
+    def hook(self, cmd, *args):
+        cmds = self.conf.get('hooks', {})
+        self.start()
+        self.attach_volumes()
+        self.deploy()
+        self.ssh(f"{cmds[cmd]} {' '.join(args)}")
 
 class baseinstance(_instance, _abstractinstance): pass
 

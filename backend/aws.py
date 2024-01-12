@@ -32,7 +32,8 @@ class instance(baseinstance):
         self.cmd(f"echo '{self.aws_key}:{self.aws_secret}' > {passwd}", hide=True)
         self.cmd(f"chmod 600 {passwd}")
         self.cmd(f"sudo mkdir -p {conf['mount']}")
-        self.cmd(f"sudo s3fs {conf['id']} {conf['mount']} -o allow_other,umask=0000,passwd_file={passwd}")
+        self.cmd(f"sudo umount {conf['mount']}", warn=True)
+        self.cmd(f"sudo s3fs {conf['id']} {conf['mount']} -o allow_other,ensure_diskfree=1024,umask=0000,passwd_file={passwd}")
         # TODO options from config file
     def _attach_storage(self, name):
         conf = self.conf['volumes'][name]
@@ -45,6 +46,11 @@ class instance(baseinstance):
             VolumeId=conf['id'])
         self.meta.wait_until_running()
         self.mount(name)
+    def _snapshot(self, name) -> str:
+        self.wait_until_running()
+        ami = self.meta.create_image(Name=name)
+        self.client.get_waiter('image_available').wait(ImageIds=[ami.id])
+        return ami.id
 
 class backend(basebackend):
     @property

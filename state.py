@@ -1,11 +1,13 @@
 import sqlite3
-from supr import log, IDLE_TIMEOUT
+from datetime import timedelta
+from supr import log, CONF
 
 
 class localstate:
     """
     State tracks instance activity and runtime.
     """
+    idle_timeout = None
     _schema = """
     CREATE TABLE IF NOT EXISTS instance_runtime (
         native_id text, 
@@ -21,9 +23,11 @@ class localstate:
     def activity_callback(cls, native_id): # thread-safe
         from supr import DB_PATH
         return lambda: cls(DB_PATH).activity(native_id)
-    def __init__(self, filename):
+    def __init__(self, filename, idle_timeout=None):
         self.db = sqlite3.connect(filename, isolation_level=None)
-        self.db.executescript(self._schema)       
+        self.db.executescript(self._schema)
+        if idle_timeout:
+            self.idle_timeout = timedelta(minutes=idle_timeout)
     def activity(self, native_id):
         log.debug(f"activity {native_id}")
         self.db.execute("""
@@ -41,7 +45,8 @@ class localstate:
         SELECT native_id
         FROM instance_activity 
         WHERE last_interacted < datetime('now', '-%s seconds')
-        """ % IDLE_TIMEOUT.total_seconds()).fetchall()
+        """ % self.idle_timeout.total_seconds()) \
+            .fetchall() if self.idle_timeout else []
     def get_runtime(self):
         return self.db.execute("""
         SELECT native_id, sum(julianday(coalesce(stop, current_timestamp)) - julianday(start)) * 24 * 60 * 60 as runtime
