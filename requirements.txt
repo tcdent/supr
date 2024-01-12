@@ -2,5 +2,3 @@ fabric
 patchwork
 boto3
 PyYAML
-sqlite3
-cron

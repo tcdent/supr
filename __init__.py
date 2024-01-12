@@ -45,8 +45,11 @@ log.addHandler(logging.FileHandler(LOG_PATH))
 from supr.state import localstate
 state = localstate(DB_PATH, CONF['IDLE_TIMEOUT'])
 
-# TODO: backend factory
-if 'aws' in CONF:
+if 'local' in CONF:
+    from supr.backend import local
+    backend = local.backend()
+    instance = local.instance
+elif 'aws' in CONF:
     from supr.backend import aws
     backend = aws.backend()
     instance = aws.instance
