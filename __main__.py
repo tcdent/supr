@@ -37,7 +37,7 @@ def main():
         case [name, 'create']: create(name)
         case [name, 'create', '--no_init']: create(name, False)
         case [name, 'start']: i(name).start(); i(name)
-        case [name, 'stop']: i(name).stop(); i(name)x
+        case [name, 'stop']: i(name).stop(); i(name)
         case [name, 'snapshot']: i(name).snapshot(); i(name)
         case [name, 'terminate']: input('terminate? (^c to cancel)'); i(name).terminate(); i(name, F_STATE['*'])
         case [name, 'ssh']: i(name).ssh()
@@ -48,6 +48,7 @@ def main():
         case [name, 'install_crontab']: i(name).install_crontab()
         case [name, 'attach_volumes']: i(name).attach_volumes()
         case [name, 'deploy']: i(name).deploy()
+        case [name, cmd]: i(name).hook(cmd)
         case [name, cmd, *args]: i(name).hook(cmd, *args)
         case _: print("invalid command"); p(F_ACTIVE)
 

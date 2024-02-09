@@ -87,7 +87,7 @@ class _instance:
     """
     Shared logic for instance implementations.
     """
-    conf = property(lambda self: self.__class__.get_conf(self.name))
+    conf = property(lambda self: CONF.get(self.name, {}))
     is_super = property(lambda self: self.conf.get('super', False))
     user = property(lambda self: self.conf['user'])
     group = property(lambda self: self.conf.get('group', self.user))
@@ -121,21 +121,21 @@ class _instance:
             "{UDL}{public_ip_address}{RST} {UDL}{private_ip_address}{RST} ", 
             #"{DIM}tags={tags}{RST}", 
         ]).format(**dict(
-            state=self.state, 
+            state=self.state or '???', 
             s="*" if self.is_super else "",
-            name=self.name, 
-            instance_type=self.instance_type, 
-            public_ip_address=self.public_ip_address, 
-            private_ip_address=self.private_ip_address, 
-            tags=self.tags, 
+            name=self.name or '???', 
+            instance_type=self.instance_type or '???', 
+            public_ip_address=self.public_ip_address or '???', 
+            private_ip_address=self.private_ip_address or '???', 
+            tags=self.tags or '???', 
         ), **ANSI)
     @staticmethod
     def get_conf(name):
-        assert {'user', 'env', 'key_pair'}.issubset(CONF[name])
-        assert 'file' in CONF[name]['key_pair']
         return CONF[name]
     @property
     def connection(self) -> connection:
+        assert {'user', 'env', 'key_pair'}.issubset(self.conf), f"missing user, env, key_pair in config"
+        assert 'file' in self.conf['key_pair'], f"missing key_pair.file in config"
         if not hasattr(self, '_connection'):
             self._connection = connection(
                 self.private_ip_address, 
@@ -173,6 +173,7 @@ class _instance:
     def run(self, cmd, *args, **kwargs):
         state.activity(self.id)
         return self.connection.run(cmd, env=self.vars, *args, **kwargs)
+    cmd = run
     def ssh(self, shell='bash'):
         return self.run(f"source {self.env}/bin/activate; {shell}", pty=True)
     def put(self, local, remote):
