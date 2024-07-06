@@ -6,7 +6,7 @@ irresponsible because it does not care about your feelings. It is
 irresponsible because it does not care about your feelings about your
 data. *--GitHub Copilot*
 
-Comments are almost non-existant, but the code is short and fairly 
+Comments are sparse, but I tried keep the code fairly 
 straigtforward. Some questionable tricks have been employed for
 entertainment purposes. I don't expect anyone will ever use this 
 in production. I had fun writing it. 
